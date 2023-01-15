@@ -1,0 +1,564 @@
+---
+output:
+  pdf_document:
+    fig_height: 3
+    fig_width: 5
+  html_document:
+    fig_height: 3
+    fig_width: 5
+  word_document:
+    fig_height: 3
+    fig_width: 5
+---
+
+## Crop Quality Prediction Using Crop Price
+### Angelica Kim    
+
+```{r, setup = TRUE, include = FALSE}
+# Do not delete this chunk
+library(mosaic)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(gdata)
+library(MVA)
+library(viridis)
+library(rpart) # for classification trees, could also check out library(tree) if desired
+library(rpart.plot) # to make trees look nicer
+library(randomForest) # for random forests and bagging
+library(e1071)
+
+options(digits = 6)
+#load any other necessary packages here
+```
+
+```{r}
+#load the data using your read-in command
+data <- read_csv("./data.csv")
+```
+
+## Introduction
+
+Most agricultural crops in Korea are traded in the public wholesale produce auctions governed by local governments. When farmers supply their produce to the wholesale market, they report the quality based on their own evaluation. However, this voluntary quality grading system in Korea thus raises doubts about its objectivity because the standards are subjective and arbitrary, which may lead to the overvaluation or undervaluation of the crops. It may also cause high price volatility because the same crops can be evaluated very differently according to subjective standards. Therefore, establishing an objective quality grading system would be important for transforming the agricultural supply chain and market to be fairer, more competitive, and more resilient. In order to provide data-driven insights into how to identify crop quality in a reliable manner, this project examines what factors can potentially represent the quality. In the absence of data on quality grades, price is used as an indicator of quality because the auction price is determined by the experts at the produce auctions who inspect the crops based on the freshness, color, shape, and ripeness, not just the arbitrary grades self-reported by the producers. An objective quality rating system would not only improve the livelihood of smallholder farmers who had been unable to sell their produce at full prices, but also upscale the overall quality of the crops distributed in the market because farmers would have to grow high quality products in order to get a higher price value for them according to the new objective standard. 
+
+Choi et al. redefines the quality grades based on the price and transaction volume. (Choi et al, 2021) However, they apply ANOVA, not classification methods, to differentiate the crops in four levels. In this project, I analyze a time series data on agricultural crops that contains information on wholesale and retail market transactions, weather, and trades (import and export). I use the price range as a proxy for crop quality and apply classification techniques to see if the data is capable of classifying the quality. Under the assumption that some information in the data, such as meteorological variables, has an underlying relationship with crop quality, I also conduct factor analysis to discover any latent factors that may be reflective of the quality.
+
+
+\newpage
+
+## Preliminary Analysis
+
+In this project, I analyze aggregate time series data that combines daily transaction information from wholesale and retail markets, daily weather in the primary growing areas, and monthly trades data for 37 crops from 2013 to 2016. The data was provided by an online artificial intelligence (AI) competition platform hosted by Korea Agro-Fisheries & Food Trade Corporation ([Link to data source](https://aifactory.space/competition/data/2091)). Note that I translated the variable names into English since the original data was from a source based in Korea.
+
+Data Description:
+
+1. `date`: Date
+2. `crop`: Type of crops encoded in numbers (0-36)
+
+Price information (All price units are in Korean Won): 
+
+3. `daily_avg_price`: Daily average price of each crop across 32 wholesale markets in Korea
+4. `daily_total_volume`: Total volume of each crop traded in 32 wholesale markets each day
+5. `avg_price_low`: Daily average of prices that fall below the value of `daily_avg_price` on that day
+6. avg_price_high": Daily average of prices that are higher than the value of `daily_avg_price` on that day          
+7.`"low_price_volume`: Total volume of each crop whose price is lower than the `daily_avg_price` for that crop traded on that day       
+8. `high_price_volume`: Total volume of each crop whose price is higher than the `daily_avg_price` for that crop traded on that day     
+
+Wholesale and retail transaction-related variables: 
+
+9. `daily_max_wholesale_price`: Daily maximum price of each crop traded in 12 wholesale markets
+10. `daily_avg_wholesale_price`: Daily average price of each crop traded in 12 wholesale markets
+11. `daily_min_wholesale_price`: Daily minimum price of each crop traded in 12 wholesale markets
+12. `daily_max_retail_price`: Daily maximum price of each crop traded in 45 retail markets
+13. `daily_avg_retail_price`:  Daily average price of each crop traded in 45 retail markets
+14. `daily_min_retail_price"`: Daily minimum price of each crop traded in 45 retail markets
+
+Trade-related variables:
+
+15. `export_weight`: Weight of the crop exported, by month (in kilograms)            
+16. `export_amount_usd`: Value of export, by month (in US Dollars)
+17. `import_weight`: Weight of the crop imported, by month (in kilograms)                 
+18. `import_amount_usd`: Value of import, by month (in US Dollars)
+19. `trade_balance_usd`: The balance of trade, which is the difference between the value of exports and imports (in US Dollars)
+
+Meteorological variables:
+
+20. `area0_base_temp`: The base temperature of each crop at the first primary growing area, below which the crop no longer develops (in Celsius degrees)
+21. `area0_max_temp`: Daily maximum temperature at the first primary growing area of each crop (in Celsius degrees)         
+22. `area0_min_temp`: Daily minimum temperature at the first primary growing area of each crop (in Celsius degrees)    
+23. `area0_avg_temp`: Daily average temperature at the first primary growing area of each crop (in Celsius degrees)    
+24. `area0_precip`: Daily precipitation amount at the first primary growing area of each crop (in milliliters)     
+There are two more sets of the same variables for two other primary growing areas.
+
+```{r}
+glimpse(data)
+```
+
+```{r}
+head(data)
+```
+
+The data contains 54057 observations and 34 variables. Each row corresponds to daily information for each crop, and the observations from the same month for each crop have the same values for the trade-related variables because they are monthly data. The missing values indicate that there were no market transactions on that day, such as holidays. While all variables seem numerical in the data, I convert `date` to Date object and `crop` to factors because `crop` denotes type of crops, though encoded numerically as ranging between 0 and 36. 
+
+```{r}
+data$date <- as.Date(as.character(data$date), "%Y%m%d")
+data$crop <- as.factor(data$crop)
+class(data$date)
+class(data$crop)
+```
+
+```{r}
+length(unique(data$crop))
+```
+
+There 37 crops in the data, which are sampled from the population of all crops traded at the wholesale produce auctions in Korea. However, I focus on two crops with the highest and lowest price volatility, respectively. I examine the standard deviations of `daily_avg_price` by crops to narrow them down. I also take into consideration the proportion of missing values when choosing the crops.
+
+```{r}
+price_sd <- data %>% 
+  group_by(crop) %>% 
+  summarize(sd = sd(daily_avg_price, na.rm=TRUE)) %>% 
+  arrange(desc(sd)) #%>% 
+  # slice(c(1, n()))
+```
+
+```{r}
+#calculate the average percentage of missing values across all numerical variables by crops
+na_prop <- data %>%
+  group_by(crop) %>% 
+  summarise(across("daily_avg_price":"area2_precip",  ~mean(is.na(.)))) %>% 
+  transmute(crop, mean_na_prop = rowMeans(.[-1])) %>% 
+  arrange(desc(mean_na_prop))
+
+price_sd <- price_sd %>% 
+  left_join(na_prop, by = "crop")
+```
+
+```{r}
+# extract top 5 crops with highest daily average price volatility
+price_sd %>% 
+  slice_max(sd, n = 5)
+```
+
+```{r}
+# extract 5 crops with lowest daily average price volatility
+price_sd %>% 
+  slice_min(sd, n = 5)
+```
+
+Among the top 5 crops with highest volatility, crop 33 has the lowest proportion of missing values in the numerical columns. For the crops with lowest volatility, there is not much difference in the missing value proportions, so I choose the one with lowest standard deviation of price. Hence, I focus on crops 33 and 9 onward. Since the missing values indicate that there were no market transactions on that day, I remove those rows from the data.
+
+```{r}
+data2 <- data %>% 
+  filter(crop %in% c(33,9)) %>% 
+  drop_na()
+
+data2$crop <- drop.levels(data2$crop) #reset the factors after dropping them
+```
+
+```{r}
+nrow(data2)
+tally(~crop, data = data2)
+```
+
+After dropping the missing values, the data is reduced to 1488 rows. Crop 9 has 790 observations, and crop 33 has 698.
+
+```{r}
+ggplot(data=data2, aes(x=date, y=daily_avg_price, color = crop)) +
+  geom_line() +
+  labs(title = "Daily Average Price (KRW) by Crops from 2013 to 2016 ")
+```
+
+The time series plot shows that crop 9 has both lower price range and lower price volatility than crop 33.
+
+```{r}
+ggplot(data2, aes(x=crop, y=daily_avg_price, fill=crop)) +
+    geom_violin(width=1.5, size=0.2, trim=FALSE) +
+    scale_fill_viridis(discrete=TRUE) +
+    scale_color_viridis(discrete=TRUE) +
+    coord_flip() + # This switch X and Y axis and allows to get the horizontal version
+    labs(title = "Distribution of Daily Average Price by Crops") +
+    xlab("Crop") +
+    ylab("Daily Average Price (KRW)")
+```
+
+```{r}
+favstats(daily_avg_price ~ crop, data = data2)
+```
+
+The violin plot shows that the distribution of daily average price for both crops is bimodal. The mean price is slightly lower than the median for crop 9, which is confirmed by its slightly left-skewed distribution. Crop 33 has a longer tail on the right, and the mean price is indeed greater than the median.
+
+In order to find the variables that potentially represent crop quality, I use `daily_avg_price` as an indicator of the quality by creating 3 price ranges--high, mid, low. Before dividing the crops into price-based categories, I examine the relationship between `daily_avg_price` and other numerical variables.
+
+```{r}
+corr <- data2 %>%
+  group_by(crop) %>% 
+  summarise(across("daily_avg_price":"area2_precip", 
+                   ~ cor(., daily_avg_price, use = "pairwise.complete.obs"))) 
+corr2 <- corr %>% 
+  pivot_longer(!crop, names_to = "variables", values_to = "correlation")
+
+corr2 %>% 
+  filter(variables != "daily_avg_price") %>%
+  group_by(crop) %>% 
+  arrange(desc(abs(correlation)), .by_group = TRUE) %>% 
+  slice(1:5)
+```
+
+Because there are 34 variables, I print only the top 5 variables that show highest correlations with daily average price for each crop. In fact, `avg_price_high` and `avg_price_low` are somewhat redundant to `daily_avg_price` because they are simply the average of the prices that are less than or greater than `daily_avg_price` on that day. It also makes sense that all wholesale price-related variables show similar correlation with the target variable because they are essentially the same wholesale prices.
+
+```{r}
+corr2 %>% 
+  filter(!grepl("price",variables)) %>%
+  group_by(crop) %>% 
+  arrange(desc(abs(correlation)), .by_group = TRUE) %>% 
+  slice(1:6)
+```
+
+With price-related variables excluded, trade-related variables show the strongest correlation of about 0.3 with daily average price for crop 9, whereas `daily_total_volume` shows up as the most highly (negatively) correlated with the price for crop 33. This suggests that the daily price of crop 9 in the domestic market may be sensitive to the imports; that crop 33 may be price-elastic since the price and volume move in the opposite direction. Among the meteorological variables, temperature seems to be most correlated with the daily price. Given that plants typically favor lower temperatures, higher temperatures would negatively impact plant productivity, leading to the increase in prices due to supply issues.
+
+```{r}
+data3 <- data2 %>% 
+  # filter(date != "2015-02-03") %>% #remove outliers to get balanced quantiles
+  group_by(crop) %>% 
+  mutate(daily_avg_price_bin = cut(daily_avg_price, 
+                                   breaks = 3,
+                                   labels = c("low","mid","high")))
+```
+
+```{r}
+tally(daily_avg_price_bin ~ crop, data = data3)
+```
+
+```{r}
+favstats(daily_avg_price~daily_avg_price_bin+crop, data = data3)
+```
+
+I divide each crop into three different price ranges--low, mid, high--which I believe is reflective of crop quality. For crop 9, there are 235 observations in "low" price range, 411 in "mid", and 144 in "high". For crop 33, there are 275 rows in low price range, 336 in mid, and 87 in high. For both crops, there are more observations tagged as "mid" than the other two categories. Since crop 9 is the crop with lowest price volatility, the difference between mean prices for each category is fairly small.
+
+In this analysis, I do not remove any outliers because they might represent unusual market activity. Agricultural markets are volatile and can fluctuate significantly in response to political, regulatory, market, or macroeconomic conditions. I would like to investigate how the data helps identify crop quality even in the presence of such anomalies.    
+
+ 
+\newpage
+
+## Methods
+
+In order to classify price range, I apply three classification techniques--trees, random forest, and SVM--to two data sets split by crop type, and compare their performance in terms of error rates. For all three models, I use all numerical variables except `daily_avg_price` because it is redundant to the target variable. Trees perform binary splits based on the predictor variables, and the splits are made where one branch ends up with a majority set of class labels. Trees may not necessarily use all variables. The impurity measure determines whether or not a node at the end of a branch is pure.  There are several parameters that can be specified for trees. `minsplit` specifies the number of observations required in a node in order for a split to occur; `minbucket` dictates the minimum number of observations required in a final node. We can also perform k-fold cross-validation by setting k via `xval`. I set `minsplit` to be 7 and `minbucket` 10 for both crops 9 and 33. For `xval`, I set it as the number of observations in the data for each crop to perform Jackknife validation to estimate true error rate, which means each observation takes the role of heldout sample once. I set `cp` = 0 to prevent pruning.
+
+The second method is random forests, which are developed to combat the greediness and instability of trees. The `mtry` parameter–number of variables allowed at each split–addresses the first issue. Like trees, random forests also have an internal variable selection mechanism. Random forests use bootstrapping to build many trees, the number of which can be specified through the `ntree` parameter. For crop 9, I set `mtry` as 10 and use 1000 trees; for crop 33, `mtry` of 6 and 1500 trees. Bootstrapping is drawing a sample with replacement from the original data with the same number of observations. This approach results in the estimated TERs since the observations that are left out from the bootstrap samples–out of bootstrap (OOB)–form a natural test set. Random forests also provide the feature importance results based on majority voting--the number of times each variable was picked for each split. I combine this information with accuracy and Gini impurity to examine which features are considered important for classifying price ranges.
+
+Lastly, I use Support Vector Machine (SVM), which performs classification by finding a hyperplane that maximizes the margin between the decision boundary and the training examples that are closest to the boundary. SVM is useful for classifying non-linearly separable data because it uses kernel methods that create nonlinear combinations of the original features to project the data onto a higher-dimensional space. While the solution from SVM is hard to interpret, the idea of finding a separation in higher dimensions often generates a better classification solution. I use radial basis function(`radial`) as the `kernel` for SVM because it is known to work well with non-linearly separable data. SVM also takes in parameters called `gamma` and `cost`. gamma defines the influence of a single training observation, and cost, often referred as C, controls the penalty for misclassification. Large gamma values lead to tighter decision boundary, and small C helps lower the overfitting of the model by letting it less strict about misclassification. For crop 9, my final choice of gamma and C is 0.03 and 10, respectively; 0.08 and 50 for crop 33. For SVM, I split the data into train and test sets. Since it is a time-series data, I train the model on the data over the span of 2013-2015 and test it on the data from 2016, instead of randomly shuffling it to make the split.
+
+The classification analysis is based on a premise that price is reflective of crop quality because I group the data into 3 bins based on `daily_avg_price` and use them as the target variable representing the quality. In addition to price, other variables in the data such as weather information could be an important indicator of crop quality because they impact the crop growth. While there is no observed information on crop quality in the data, I conduct exploratory factor analysis for each crop to find the latent factors that help identify quality, under the assumption that there may be some underlying relationship between the manifest variables and quality. I run maximum likelihood factor analysis, which requires the assumption of multivariate normality for the data. While we know that the condition may not be satisfied from the preliminary analysis where the distribution of `daily_avg_price` was not normal, we proceed with caution because the results will be used as a guide for exploratory factor analysis. For factor analysis, I remove redundant factors discovered from the preliminary analysis because the `factanal()` function wasn't able to find a solution when all the variables were used. Given 9 variables, I run sequential hypothesis tests to determine the number of factors to keep since the number at which p-value becomes insignificant suggests that no more factors are needed. For both crops, I use four factors. A factor solution is obtained by finding communality and uniqueness. Communality is the variance shared with the other variables via the common factors, and uniqueness measures the variability not shared with other variables. I use uniqueness to evaluate the fitness of the variables in the solution because high uniqueness indicates that the extracted factor is not contributing much to those variables. I examine the factor loadings to interpret the factors and see if they convey any latent characteristics about crop quality. A factor solution is unique up to rotation so that when rotated, each variable is highly loaded on at most one factor. The `factanal()` command finds a solution with varimax rotation by default, but I also fit another solution with promax rotation to see if I can obtain a more interpretable solution. In the final step of factor analysis, I compute factor scores using Bartlett's method and check if the factor scores recover the daily average price ranges used for classification.
+
+\newpage
+
+## Results
+
+### Classification - Trees
+
+First, I compare three classification models for each crop in terms of the apparent error rates and true error rates. For all three methods, all variables except `daily_avg_price` were used as predictors because its range is equivalent to the target variable `daily_avg_price_bin`. 
+
+```{r}
+data_9 <- data3 %>% 
+  filter(crop == "9") %>% 
+  ungroup() %>% 
+  select(-c(date, crop, daily_avg_price))
+
+data_33 <- data3 %>% 
+  filter(crop == "33") %>% 
+  ungroup() %>% 
+  select(-c(date, crop, daily_avg_price))
+```
+
+
+```{r}
+set.seed(240)
+bf.control <- rpart.control(minsplit = 7, minbucket = 10, xval = 790, cp = 0) 
+bf.treeorig <- rpart(daily_avg_price_bin ~ .,
+                     data = data_9, method = "class", control = bf.control)
+printcp(bf.treeorig)
+
+plot(bf.treeorig)
+text(bf.treeorig, cex = 0.7)
+```
+
+```{r}
+#cp=0 -> better error rates
+AER <- 0.4797 * 0.1135; AER
+estTER <- 0.4797 * 0.1847; estTER
+```
+
+For crop 9, the tree model with minsplit of 7, minbucket of 10 yields an AER of 5% and an estimated TER of 8.8% from leave-one-out CV. The error rates are found relative to the root node error, which is the error rate if all observations were classified to the class with the majority observations--AER = root node error * rel error and estimated TER = root node error * xerror. While the estimated TER is slightly higher, the model seems to be performing fairly well. 
+
+```{r}
+set.seed(240)
+bf.control <- rpart.control(minsplit = 7, minbucket = 10, xval = 698, cp = 0) 
+bf.treeorig <- rpart(daily_avg_price_bin ~ .,
+                     data = data_33, method = "class", control = bf.control)
+printcp(bf.treeorig)
+
+plot(bf.treeorig)
+text(bf.treeorig, cex = 0.7)
+```
+
+```{r}
+AER <- 0.5186 * 0.1022; AER
+estTER <- 0.5186 * 0.1409; estTER
+```
+
+The same model showed similar performance on crop 33--the AER of 5% and the estimated TER of 7%. For both crops, `avg_price_high` and `avg_price_low`, which are average prices falling into upper and lower ranges, dominate the trees. This makes sense because knowing the upper and lower price bands on that day would inform the average price range for that day. 
+
+
+### Classification - Random Forests
+
+Building many trees through random forest models tries to improve on the greediness and instability of trees. Each tree is generated using a bootstrap sample from the original data, where a random sample of variables are available to split on at each node. Observations left out of the bootstrap sample form a natural test data set and produce an out-of-bag (OOB) error rate.
+
+```{r}
+set.seed(10)
+bf.rf <- randomForest(daily_avg_price_bin ~ .,
+                      data = data_9, 
+                      mtry = 10, 
+                      ntree = 1000, 
+                      importance = T, 
+                      proximity = T)
+bf.rf
+```
+
+```{r}
+table(data_9$daily_avg_price_bin, predict(bf.rf, data_9))
+```
+
+For crop 9, I set mtry to be 10 and ntree 1000. While we obtained error rates relative to the root node error in trees, we use confusion matrix for random forests. OOB confusion matrix provides the estimated TER; AER is from the confusion matrix between the true class labels and the predicted classes from the `predict()` command. The AER is 0--all training observations are classified correctly, and the estimated TER is 6.84%, which is an improvement compared to the performance of trees.
+
+```{r}
+set.seed(10)
+bf.rf2 <- randomForest(daily_avg_price_bin ~ .,
+                      data = data_33, 
+                      mtry = 6, 
+                      ntree = 1500, 
+                      importance = T, 
+                      proximity = T)
+bf.rf2
+```
+
+```{r}
+table(data_33$daily_avg_price_bin, predict(bf.rf2, data_33))
+```
+
+For crop 33, mtry of 6 and ntree of 1500 for crop 33 yielded the lowest error rates. AER was also 0, and the estimated TER of 7.02%, which is similar from the trees.
+
+```{r, fig.height=6, fig.width = 8}
+varImpPlot(bf.rf)
+```
+
+```{r, eval = FALSE}
+varImpPlot(bf.rf2)
+```
+
+I also create variable importance plots where variables higher up are better because they result in larger mean decreases in accuracy or Gini coefficients that need to be minimized. For both crops, the upper and price ranges show up as the most important for classification, and there is agreement between the accuracy and Gini lists.
+
+### Classification - Support Vector Machine (SVM)
+
+For SVM, I manually split the data into train and test sets because they are time series data and price tends to follow temporal patterns. Train data is from 2013 to 2015 and test data spans 2016. 
+
+```{r}
+data9_train <- data3 %>% 
+  filter(crop == "9" & date>="2013-01-02" & date <= "2015-12-31" ) %>% 
+  ungroup() %>% 
+  select(-c(date, crop, daily_avg_price)) 
+
+data9_test <- data3 %>% 
+  filter(crop == "9" & date>="2016-01-02" & date <= "2016-12-31" ) %>% 
+  ungroup() %>% 
+  select(-c(date, crop, daily_avg_price)) 
+```
+
+```{r}
+data33_train <- data3 %>% 
+  filter(crop == "33" & date>="2013-01-02" & date <= "2015-12-31" ) %>% 
+  ungroup() %>% 
+  select(-c(date, crop, daily_avg_price)) 
+
+data33_test <- data3 %>% 
+  filter(crop == "33" & date>="2016-01-02" & date <= "2016-12-31" ) %>% 
+  ungroup() %>% 
+  select(-c(date, crop, daily_avg_price)) 
+```
+
+```{r, eval = FALSE}
+svm1 <- svm(daily_avg_price_bin ~ ., data = data9_train, gamma = 0.03, cost = 3, 
+            kernel = "radial")
+summary(svm1)
+```
+
+```{r, eval = FALSE}
+svm1 <- svm(data9_train$daily_avg_price_bin ~ ., data = data9_train, gamma = 0.03, 
+            cost = 50, kernel = "radial")
+summary(svm1)
+```
+
+```{r}
+svm1 <- svm(daily_avg_price_bin ~ ., data = data9_train, gamma = 0.03, cost = 10, 
+            kernel = "radial")
+summary(svm1)
+```
+
+```{r}
+svm1predtrain <- predict(svm1, data9_train) 
+svm1predtest <- predict(svm1, data9_test) 
+table(data9_train$daily_avg_price_bin, svm1predtrain) 
+table(data9_test$daily_avg_price_bin, svm1predtest) 
+```
+
+Through trial and error of gamma and cost, it appears that lower gamma and larger cost seem to yield lower error rates. Larger cost means that incorrect classifications are penalized more, but too much regularization would lead to overfitting. My final choice of gamma and cost for crop 9 is 0.03 and 10, respectively. The model has AER of (4+1)/548 = 0.9% and estimated TER of (10+6+6+26)/242 = 19.8%.
+
+```{r, eval = FALSE}
+svm2 <- svm(daily_avg_price_bin ~ ., data = data33_train, gamma = 0.08, cost =25, kernel = "radial")
+summary(svm2)
+```
+
+```{r}
+svm2 <- svm(daily_avg_price_bin ~ ., data = data33_train, gamma = 0.08, cost = 50, kernel = "radial")
+summary(svm2)
+```
+
+```{r}
+svm2predtrain <- predict(svm2, data33_train) 
+svm2predtest <- predict(svm2, data33_test) 
+table(data33_train$daily_avg_price_bin, svm2predtrain) 
+table(data33_test$daily_avg_price_bin, svm2predtest) 
+```
+
+```{r}
+tally(~daily_avg_price_bin, data = data33_test)
+```
+
+```{r}
+tally(~daily_avg_price_bin, data = data33_train)
+```
+
+For crop 33, I set gamma as 0.08 and cost 50. Crop 33 has AER of 0, but estimated TER of (11+5+43)/216 = 27.3%. In fact, none of the high price ranges for crop 33 were classified correctly. Although there are twice more observations in the train test, the number of observations for high price range is very similar in both data. This would mean that price tended to be higher in 2016. Thus, it would be difficult for the model to detect unusually high prices.
+
+Overall, random forest performed best for both crops: AER of 0 and estimated TER of 7.02% for crop 33 and 6.84% for crop 9. While I expected SVM to produce best classification results because it finds a hyperplane in higher dimensions, tree-based models were more effective for classifying the price ranges. 
+
+### Factor Analysis
+
+Next, I conduct exploratory factor analysis to find the underlying factors that may be  reflective of crop quality. First, I tried using all the variables, but the `factanaly()` function wasn't able to find a solution. Thus, I removed the variables that are redundant to `daily_avg_price` and `daily_total_volume`, such as `avg_price_low` and `high_price_volume`. I also choose weather information from one of the primary growing areas only. For both crops, I use 9 variables for factor analysis.
+
+```{r}
+data9_2 <- data3 %>% 
+  filter(crop == "9") %>% 
+  ungroup()
+
+data33_2 <- data3 %>% 
+  filter(crop == "33") %>% 
+  ungroup() 
+```
+
+```{r, eval = FALSE}
+cor(select(data9_2, -date, -crop, -daily_avg_price_bin), use = "pairwise.complete.obs")
+cor(select(data33_2, -date, -crop, -daily_avg_price_bin), use = "pairwise.complete.obs")
+```
+
+While I do not include the correlation matrix output due to large number of variables, most variables seem to be moderately correlated. In particular, the variables that convey similar information, such as `trade_balance_usd` and `import_usd` or temperatures across three areas, show very strong correlations. The correlations between the observed variables suggest that there are some underlying relationships among the variables. 
+
+While we observed that `daily_avg_price` did not have a normal distribution, which means that multivariate normality assumption for factor analysis is violated, I proceed with caution because factor analysis will be used as a guide for exploratory purposes in this project.
+
+```{r}
+data9_3 <- data9_2 %>% 
+  select(daily_avg_price, daily_total_volume,daily_avg_wholesale_price, 
+         daily_avg_retail_price, export_weight, import_weight, trade_balance_usd, 
+        area0_avg_temp, area0_precip)
+
+data33_3 <- data33_2 %>% 
+  select(daily_avg_price, daily_total_volume,daily_avg_wholesale_price, 
+         daily_avg_retail_price, export_weight, import_weight, trade_balance_usd, 
+        area0_avg_temp, area0_precip)
+```
+
+```{r}
+q <- 9 #number of variables
+k <- 5 #number of factors
+df <- (q*(q+1)/2)-(q*(k+1)-(k*(k-1)/2)) 
+df
+```
+
+```{r}
+sapply(1:5, function(f) factanal(data9_3, factors = f, start=rep(0, 9))$PVAL)
+```
+
+Given 9 variables, we can fit at most 5 factors. I tested a number of factors from 1 to 5, but all of them had very low p-values. So I keep 4 factors.
+
+```{r}
+FAcar <- factanal(data9_3, factors = 4, start=rep(0,9)) #50 % of variation in variables explained by the factors
+print(FAcar)
+```
+
+```{r, eval=FALSE}
+FAcar2 <- factanal(data9_3, factors = 4, start=rep(0,9), rotation = "promax") 
+print(FAcar2)
+```
+
+I fist discuss the factor solution for crop 9. `area0_precip`, `daily_total_volume`, `daily_avg_retail_price`, and `area0_avg_temp` have high uniqueness, which indicates that the factors are not contributing much to these variables. The first factor has high loadings on `import_weight` and `trade_balance_usd` with opposite signs. The third factor has moderately high loadings on `export_weight`. Both factors thus seem to be related to trades. Factor 2 loads highly on `daily_avg_price` and `daily_avg_wholesale_price`. This suggests that the second factor represents crop price. In other words, it appears that the factors simply explain the characteristics of the original variables in the data description--whether they are price-related or trade-related, not necessarily crop quality. I fit another 4-factor model with a promax rotation. The first and second factors are flipped, but the overall interpretation of the factors did not change. Also, it is important to note that I had to set the starting values for the uniqueness to acquire the factor solution. This suggests that there may not be a strong or stable solution.
+
+```{r}
+FAcar3 <- factanal(data33_3, factors = 4, start=rep(0,9)) 
+print(FAcar3)
+```
+
+```{r, eval = FALSE}
+FAcar4 <- factanal(data33_3, factors = 4, start=rep(0,9),  rotation = "promax") 
+print(FAcar4)
+```
+
+For crop 33, the same set of variables except `daily_avg_retail_price` showed highest uniqueness values. Another difference is high uniqueness for `export_weight`. Note that I also had to set limiting values for uniqueness to obtain a factor solution, which discounts the stability of the solution. Factor 1 had high loadings on all of the price-related variables, including the retail price. The second factor loaded highlly on trade-related variables. In other words, we can interpret the factors for the second crop in a similar manner as the other one. The factor loadings slightly changed when fitting with a promax rotation, but the factors did not even flip this time. 
+
+While factor analysis failed to uncover the latent factors that may be reflective of crop quality, I examine if the factor scores are capable of separating the daily average price ranges that were used for classification. I remove `daily_avg_price` from the factor model because it was used to create the price ranges we're trying to separate.
+
+```{r}
+FAscores <- factanal(select(data9_3, -daily_avg_price), factors = 3, start=rep(0,8), 
+                     scores = "Bartlett")
+FAscores
+```
+
+```{r}
+gf_point(FAscores$scores[, 1] ~ FAscores$scores[, 2], color = ~ daily_avg_price_bin,
+         data=data9_2) +
+  labs(title = "1st and 2nd Factor Scores by Daily Average Price Range")
+```
+
+```{r}
+gf_point(FAscores$scores[, 1] ~ FAscores$scores[, 3], color = ~ daily_avg_price_bin,
+         data=data9_2) +
+  labs(title = "1st and 3rd Factor Scores by Daily Average Price Range")
+```
+
+The first and second factors represent trade information and wholesale price for crop 9. While there is some overlap, they are better at separating the daily average price ranges than the first and third factor scores. This suggests that wholesale transaction and trade information help explain daily average price of crops in the domestic market.
+
+```{r}
+FAscores2 <- factanal(select(data33_3, -daily_avg_price), factors = 3, start=rep(0,8), 
+                      scores = "Bartlett")
+```
+
+```{r}
+gf_point(FAscores2$scores[, 1] ~ FAscores2$scores[, 2], color = ~ daily_avg_price_bin,
+         data=data33_2) +
+  labs(title = "1st and 2nd Factor Scores by Daily Average Price Range")
+```
+
+We obtain similar results for crop 33. Since the first and second factors also represent trade information and wholesale price, daily average price ranges are fairly well-separated in the factor space. However, the separation of the price ranges does not imply that the factor model has discovered the latent factors that explain crop quality. 
+
+\newpage
+
+## Conclusion 
+
+In this analysis, classification techniques were applied to distinguish between crop price ranges under the assumption that price would be reflective of crop quality. Three models were considered--trees, random forests, and SVM--with all predictors. Based on their performance, random forests were chosen as the final model for both crops. Both had the AER of 0; the estimated TER was 6.84% for crop 9 and 7.02% for crop 33. The feature importance results from both models indicate that knowing about the average prices of the upper and lower price ranges help classify the which price range the crop belongs to on that day. While weather information serves as an important indicator of crop quality, none of the meteorological variables showed up as important variables. This may be attributable to two reasons. The weather-related variables in the data describe the weather conditions of three primary growing areas for each crop on the day when the transaction has occurred. What really impacts the crop quality is the meteorological factors along the growth cycle of the crops. Thus, I would like to examine further whether the meteorological data along the life cycle of cycles help better identify price-based crop quality. In addition, SVM had a higher estimated estimated TER than the tree-based models. I would also check if there is any improvement in the performance after scaling the data because the variables were on very different scales.
+
+In order to find the underlying factors that may be reflective of crop quality, we also ran factor analysis. The factors that were found captured the inherent characteristics of the manifest variables but nothing about crop quality. However, since one of the factors represented crop price information, they were fairly good at separating price ranges. The fact that I had to use a subset of variables and set starting values for uniqueness to make the factor analysis function work suggests that there may not be a stable solution in the first place. One of the reasons behind this would be the violation of multivariate normality assumption. While I still ran maximum likelihood factor analysis as an exploratory guide, I would try principal component factor analysis in the future to see if it uncovers any latent relationships between the variables and crop quality. Another reason why the factor analysis failed to discover any latent information, especially the one between price and crop quality, would be because price is not solely determined by quality. While crop quality is one of the determinants of crop price, it is also very volatile and easily impacted by macroeconomic, regulatory, and political conditions. In other words, it would be hard to pinpoint the underlying characteristics about crop quality given the current data because there are many complicated factors intertwined with price and there are not enough variables that explain crop quality.
+
+\newpage
+
+## Citations
+
+Korea Agro-Fisheries & Food Trade Corporation. Agricultural Crop Price Prediction. AI Factory, 2022. <https://aifactory.space/competition/detail/2091>
+
